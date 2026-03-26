@@ -1,4 +1,4 @@
-import asyncio
+  import asyncio
 import os
 from datetime import datetime, timedelta
 import redis.asyncio as redis
@@ -10,15 +10,21 @@ from aiogram.types import (
     LabeledPrice, PreCheckoutQuery, CallbackQuery
 )
 
-BOT_TOKEN = os.getenv('BOT_TOKEN', 'YOUR_BOT_TOKEN_HERE')
+BOT_TOKEN = os.getenv('BOT_TOKEN', '')
 REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost:6379/0')
 
-TRIAL_DAYS = 3  # Пробный период в днях (можно менять)
+TRIAL_DAYS = 3
 
 PRICES = {'week': 10, 'twoweeks': 20, 'threeweeks': 30, 'month': 40}
 DAYS_MAP = {'week': 7, 'twoweeks': 14, 'threeweeks': 21, 'month': 28}
 
-r = redis.from_url(REDIS_URL, decode_responses=True)
+# Инициализация Redis с проверкой
+try:
+    r = redis.from_url(REDIS_URL, decode_responses=True)
+except Exception as e:
+    print(f"Redis connection error: {e}")
+    r = None
+
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
@@ -47,14 +53,6 @@ def setup_menu():
             [InlineKeyboardButton(text="🔼 Верхний блок", callback_data="set_block_top")],
             [InlineKeyboardButton(text="🔽 Нижний блок", callback_data="set_block_bottom")],
             [InlineKeyboardButton(text="🔙 Назад", callback_data="back_main")]
-        ]
-    )
-
-def skip_or_back_menu():
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="⏭️ Пропустить", callback_data="skip_block")],
-            [InlineKeyboardButton(text="🔙 Назад", callback_data="back_setup")]
         ]
     )
 
@@ -93,6 +91,9 @@ def link_input_menu():
 # ====================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ======================
 
 async def is_active(user_id: int) -> bool:
+    if not r:
+        return True
+    
     now = datetime.utcnow()
     
     sub_end = await r.get(f'user:{user_id}:sub_end')
@@ -114,6 +115,9 @@ async def is_active(user_id: int) -> bool:
     return False
 
 async def is_expired(user_id: int) -> bool:
+    if not r:
+        return False
+    
     now = datetime.utcnow()
     
     sub_end = await r.get(f'user:{user_id}:sub_end')
@@ -135,12 +139,15 @@ async def is_expired(user_id: int) -> bool:
     return True
 
 async def start_trial(user_id: int):
+    if not r:
+        return False
+    
     trial_started = await r.exists(f'user:{user_id}:trial_started')
     if trial_started:
         return False
     
     now = datetime.utcnow()
-    end = now + timedelta(days=TRIAL_DAYS)  # Используем дни вместо минут
+    end = now + timedelta(days=TRIAL_DAYS)
     
     await r.set(f'user:{user_id}:trial_started', now.isoformat())
     await r.set(f'user:{user_id}:trial_end', end.isoformat())
@@ -148,16 +155,25 @@ async def start_trial(user_id: int):
     return True
 
 async def get_referral_link(user_id: int) -> str:
+    if not r:
+        return f"https://t.me/bot?start=ref{user_id}"
+    
     ref_code = await r.get(f'user:{user_id}:ref_code')
     if not ref_code:
         ref_code = f'ref{user_id % 1000000:06d}'
         await r.set(f'user:{user_id}:ref_code', ref_code)
         await r.set(f'ref:{ref_code}', user_id)
     
-    bot_info = await bot.get_me()
-    return f"https://t.me/{bot_info.username}?start={ref_code}"
+    try:
+        bot_info = await bot.get_me()
+        return f"https://t.me/{bot_info.username}?start={ref_code}"
+    except:
+        return f"https://t.me/bot?start={ref_code}"
 
 async def get_user_settings(user_id: int):
+    if not r:
+        return None, '', ''
+    
     channel = await r.get(f'user:{user_id}:channel')
     block_top = await r.get(f'user:{user_id}:block_top') or ''
     block_bottom = await r.get(f'user:{user_id}:block_bottom') or ''
@@ -171,69 +187,45 @@ def clean_text(text: str) -> str:
     text = re.sub(r'\n\s*\n', '\n', text.strip())
     return text.strip()
 
-async def get_subscription_info(user_id: int) -> str:
-    """Получает информацию о подписке для уведомлений"""
-    now = datetime.utcnow()
-    
-    sub_end = await r.get(f'user:{user_id}:sub_end')
-    if sub_end:
-        end_date = datetime.fromisoformat(sub_end)
-        if end_date > now:
-            days_left = (end_date - now).days
-            return f"📅 Подписка активна до: {end_date.strftime('%d.%m.%Y')} ({days_left} дней)"
-    
-    trial_end = await r.get(f'user:{user_id}:trial_end')
-    if trial_end:
-        end_date = datetime.fromisoformat(trial_end)
-        if end_date > now:
-            days_left = (end_date - now).days
-            return f"🎁 Пробный период до: {end_date.strftime('%d.%m.%Y')} ({days_left} дней)"
-    
-    extra = int(await r.get(f'user:{user_id}:extra_days') or 0)
-    if extra > 0:
-        return f"➕ Бонусных дней: {extra}"
-    
-    return "⏰ Подписка не активна"
-
 # ====================== КОМАНДЫ ======================
 
 @dp.message(Command('start'))
 async def cmd_start(message: Message):
     user_id = message.from_user.id
-    ref_param = message.text.split()[-1] if len(message.text.split()) > 1 else None
     
-    # Проверяем, новый ли пользователь
-    is_new_user = not await r.exists(f'user:{user_id}:first_seen')
-    
-    if is_new_user:
-        await r.set(f'user:{user_id}:first_seen', datetime.utcnow().isoformat())
-        await r.set(f'user:{user_id}:username', message.from_user.username or 'нет')
-    
-    # Обработка реферальной ссылки
-    if ref_param and ref_param.startswith('ref'):
-        referrer_code = ref_param[3:]
-        referrer_id = await r.get(f'ref:{referrer_code}')
+    if r:
+        is_new_user = not await r.exists(f'user:{user_id}:first_seen')
         
-        if referrer_id and int(referrer_id) != user_id:
-            already_referred = await r.get(f'user:{user_id}:referred_by')
-            if not already_referred:
-                await r.incr(f'user:{referrer_id}:extra_days')
-                await r.set(f'user:{user_id}:referred_by', referrer_id)
-                
-                try:
-                    await bot.send_message(
-                        int(referrer_id),
-                        f"🎉 По вашей ссылке зарегистрировался пользователь!\n"
-                        f"➕ +1 день бесплатно!"
-                    )
-                except:
-                    pass
-                
-                await message.answer("✅ Вы приглашены по партнёрской ссылке!\n🔥 +1 день начислен пригласившему!")
+        if is_new_user:
+            await r.set(f'user:{user_id}:first_seen', datetime.utcnow().isoformat())
+            await r.set(f'user:{user_id}:username', message.from_user.username or 'нет')
+        
+        # Обработка реферальной ссылки
+        ref_param = message.text.split()[-1] if len(message.text.split()) > 1 else None
+        if ref_param and ref_param.startswith('ref'):
+            referrer_code = ref_param[3:]
+            referrer_id = await r.get(f'ref:{referrer_code}')
+            
+            if referrer_id and int(referrer_id) != user_id:
+                already_referred = await r.get(f'user:{user_id}:referred_by')
+                if not already_referred:
+                    await r.incr(f'user:{referrer_id}:extra_days')
+                    await r.set(f'user:{user_id}:referred_by', referrer_id)
+                    
+                    try:
+                        await bot.send_message(
+                            int(referrer_id),
+                            f"🎉 По вашей ссылке зарегистрировался пользователь!\n"
+                            f"➕ +1 день бесплатно!"
+                        )
+                    except:
+                        pass
+                    
+                    await message.answer("✅ Вы приглашены по партнёрской ссылке!\n🔥 +1 день начислен пригласившему!")
 
     if await is_expired(user_id):
         ref_link = await get_referral_link(user_id)
-        extra_days = int(await r.get(f'user:{user_id}:extra_days') or 0)
+        extra_days = int(await r.get(f'user:{user_id}:extra_days') or 0) if r else 0
         
         await message.answer(
             f"⏰ <b>Время использования истекло</b>\n\n"
@@ -247,7 +239,6 @@ async def cmd_start(message: Message):
         )
         return
 
-    # Проверяем, только что начался ли пробный период
     trial_just_started = await start_trial(user_id)
     
     welcome_text = (
@@ -262,8 +253,6 @@ async def cmd_start(message: Message):
     welcome_text += "Нажми <b>«Настроить копирование»</b> чтобы начать!"
     
     await message.answer(welcome_text, parse_mode='HTML', reply_markup=main_menu())
-
-# ====================== CALLBACKS ======================
 
 @dp.callback_query(F.data == "how_it_works")
 async def how_it_works(callback: CallbackQuery):
@@ -357,6 +346,10 @@ async def back_setup(callback: CallbackQuery):
 @dp.callback_query(F.data == "skip_block")
 async def skip_block(callback: CallbackQuery):
     user_id = callback.from_user.id
+    if not r:
+        await callback.answer("Ошибка базы данных", show_alert=True)
+        return
+        
     state = await r.get(f'user:{user_id}:state')
     
     if state in ['set_block_top', 'waiting_link_text_top', 'waiting_link_url_top']:
@@ -379,6 +372,10 @@ async def skip_block(callback: CallbackQuery):
 @dp.callback_query(F.data == "back_to_block_input")
 async def back_to_block_input(callback: CallbackQuery):
     user_id = callback.from_user.id
+    if not r:
+        await callback.answer("Ошибка базы данных", show_alert=True)
+        return
+        
     current_block = await r.get(f'user:{user_id}:current_block')
     
     if current_block == 'top':
@@ -389,14 +386,16 @@ async def back_to_block_input(callback: CallbackQuery):
     await r.delete(f'user:{user_id}:temp_link_text')
     await r.delete(f'user:{user_id}:current_block')
 
-# ====================== НАСТРОЙКА ======================
-
 @dp.callback_query(F.data == "set_channel")
 async def set_channel(callback: CallbackQuery):
     user_id = callback.from_user.id
     
     if await is_expired(user_id):
         await callback.answer("❌ Время использования истекло!", show_alert=True)
+        return
+    
+    if not r:
+        await callback.answer("Ошибка базы данных", show_alert=True)
         return
     
     await callback.message.edit_text(
@@ -419,6 +418,10 @@ async def set_block_top(callback: CallbackQuery):
     
     if await is_expired(user_id):
         await callback.answer("❌ Время использования истекло!", show_alert=True)
+        return
+    
+    if not r:
+        await callback.answer("Ошибка базы данных", show_alert=True)
         return
     
     current = await r.get(f'user:{user_id}:block_top') or ''
@@ -447,6 +450,10 @@ async def set_block_bottom(callback: CallbackQuery):
         await callback.answer("❌ Время использования истекло!", show_alert=True)
         return
     
+    if not r:
+        await callback.answer("Ошибка базы данных", show_alert=True)
+        return
+    
     current = await r.get(f'user:{user_id}:block_bottom') or ''
     
     text = (
@@ -465,11 +472,13 @@ async def set_block_bottom(callback: CallbackQuery):
     await r.set(f'user:{user_id}:state', 'set_block_bottom')
     await callback.answer()
 
-# ====================== КЛИКАБЕЛЬНЫЕ ССЫЛКИ ======================
-
 @dp.callback_query(F.data == "add_link_top")
 async def add_link_top(callback: CallbackQuery):
     user_id = callback.from_user.id
+    
+    if not r:
+        await callback.answer("Ошибка базы данных", show_alert=True)
+        return
     
     await callback.message.edit_text(
         "🔗 <b>Кликабельная ссылка</b>\n\n"
@@ -487,6 +496,10 @@ async def add_link_top(callback: CallbackQuery):
 async def add_link_bottom(callback: CallbackQuery):
     user_id = callback.from_user.id
     
+    if not r:
+        await callback.answer("Ошибка базы данных", show_alert=True)
+        return
+    
     await callback.message.edit_text(
         "🔗 <b>Кликабельная ссылка</b>\n\n"
         "Шаг 1/2: Отправьте текст ссылки\n"
@@ -499,11 +512,14 @@ async def add_link_bottom(callback: CallbackQuery):
     await r.set(f'user:{user_id}:current_block', 'bottom')
     await callback.answer()
 
-# ====================== ОБРАБОТКА ВВОДА ======================
-
 @dp.message(F.text)
 async def handle_input(message: Message):
     user_id = message.from_user.id
+    
+    if not r:
+        await message.answer("❌ Ошибка базы данных")
+        return
+        
     state = await r.get(f'user:{user_id}:state')
     
     if not state:
@@ -634,8 +650,6 @@ async def handle_input(message: Message):
         await r.delete(f'user:{user_id}:temp_link_text')
         await r.delete(f'user:{user_id}:current_block')
 
-# ====================== ОБРАБОТКА ПЕРЕСЫЛАЕМЫХ ПОСТОВ ======================
-
 @dp.message(F.forward_origin)
 async def handle_forward(message: Message):
     user_id = message.from_user.id
@@ -672,7 +686,6 @@ async def handle_forward(message: Message):
         )
         return
 
-    # Проверяем, только что начался ли пробный период
     trial_just_started = await start_trial(user_id)
     if trial_just_started:
         await message.answer(
@@ -713,10 +726,6 @@ async def handle_forward(message: Message):
             success_text += "🔽 Нижний блок добавлен\n"
         success_text += "🧹 Очищено"
         
-        # Добавляем информацию о подписке
-        sub_info = await get_subscription_info(user_id)
-        success_text += f"\n\n{sub_info}"
-        
         await message.answer(success_text, parse_mode='HTML', reply_markup=main_menu())
         
     except Exception as e:
@@ -726,13 +735,11 @@ async def handle_forward(message: Message):
             reply_markup=main_menu()
         )
 
-# ====================== РЕФЕРАЛЬНАЯ ПРОГРАММА ======================
-
 @dp.callback_query(F.data == "referral_program")
 async def show_referral(callback: CallbackQuery):
     user_id = callback.from_user.id
     ref_link = await get_referral_link(user_id)
-    extra_days = int(await r.get(f'user:{user_id}:extra_days') or 0)
+    extra_days = int(await r.get(f'user:{user_id}:extra_days') or 0) if r else 0
     
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -750,8 +757,6 @@ async def show_referral(callback: CallbackQuery):
         reply_markup=kb
     )
     await callback.answer()
-
-# ====================== ОПЛАТА ======================
 
 @dp.callback_query(F.data == "subscription")
 async def subscription(callback: CallbackQuery):
@@ -819,6 +824,10 @@ async def pre_checkout(pre: PreCheckoutQuery):
 
 @dp.message(F.successful_payment)
 async def got_payment(message: Message):
+    if not r:
+        await message.answer("❌ Ошибка базы данных")
+        return
+        
     payload = message.successful_payment.invoice_payload
     parts = payload.split('_')
     
@@ -832,7 +841,7 @@ async def got_payment(message: Message):
         return
     
     days = DAYS_MAP[period]
-    price = PRICES[price]
+    price = PRICES[period]
     extra = int(await r.get(f'user:{user_id}:extra_days') or 0)
     total_days = days + extra
     
@@ -846,11 +855,9 @@ async def got_payment(message: Message):
     if current_sub_end:
         current_end = datetime.fromisoformat(current_sub_end)
         if current_end > now:
-            # Продлеваем от текущей даты окончания
             end_date = current_end + timedelta(days=total_days)
             is_extended = True
         else:
-            # Подписка истекла, начинаем с текущей даты
             end_date = now + timedelta(days=total_days)
             is_extended = False
     else:
@@ -879,155 +886,168 @@ async def got_payment(message: Message):
             reply_markup=main_menu()
         )
 
-# ====================== CRON: ПРОВЕРКА ПОДПИСОК ======================
-
 async def subscription_checker():
+    """Фоновая задача для проверки подписок и отправки уведомлений"""
     while True:
-        await asyncio.sleep(60)  # Проверка каждую минуту
+        await asyncio.sleep(3600)  # Проверка каждый час (было 60 сек)
         
+        if not r:
+            continue
+            
         now = datetime.utcnow()
         
         # Проверка пробных периодов
-        async for key in r.scan_iter('user:*:trial_end'):
-            user_id = int(key.split(':')[1])
-            trial_str = await r.get(key)
-            
-            if not trial_str:
-                continue
-            
-            try:
-                trial_end = datetime.fromisoformat(trial_str)
-                time_diff = (now - trial_end).total_seconds()
-                
-                # Уведомление за 1 день до окончания
-                day_before = trial_end - timedelta(days=1)
-                if 0 <= (now - day_before).total_seconds() <= 60:
-                    notified = await r.get(f'user:{user_id}:trial_reminder_sent')
-                    if not notified:
-                        try:
-                            await bot.send_message(
-                                user_id,
-                                f"⏰ <b>Пробный период закончится завтра!</b>\n\n"
-                                f"Чтобы продолжить использовать бота:\n"
-                                f"• Купите подписку звёздами\n"
-                                f"• Или пригласите друга\n\n"
-                                f"Нажмите /start для выбора тарифа",
-                                parse_mode='HTML'
-                            )
-                            await r.set(f'user:{user_id}:trial_reminder_sent', '1')
-                        except Exception as e:
-                            print(f"Не удалось отправить напоминание {user_id}: {e}")
-                
-                # Уведомление об окончании
-                if 0 <= time_diff <= 60:
-                    notified = await r.get(f'user:{user_id}:expiry_notified')
-                    if notified:
+        try:
+            async for key in r.scan_iter('user:*:trial_end'):
+                try:
+                    user_id = int(key.split(':')[1])
+                    trial_str = await r.get(key)
+                    
+                    if not trial_str:
                         continue
                     
-                    sub_end = await r.get(f'user:{user_id}:sub_end')
-                    if sub_end and datetime.fromisoformat(sub_end) > now:
-                        continue
+                    trial_end = datetime.fromisoformat(trial_str)
                     
-                    extra = int(await r.get(f'user:{user_id}:extra_days') or 0)
-                    if extra > 0:
-                        continue
+                    # Уведомление за 1 день до окончания
+                    day_before = trial_end - timedelta(days=1)
+                    if 0 <= (now - day_before).total_seconds() <= 3600:
+                        notified = await r.get(f'user:{user_id}:trial_reminder_sent')
+                        if not notified:
+                            try:
+                                await bot.send_message(
+                                    user_id,
+                                    f"⏰ <b>Пробный период закончится завтра!</b>\n\n"
+                                    f"Чтобы продолжить использовать бота:\n"
+                                    f"• Купите подписку звёздами\n"
+                                    f"• Или пригласите друга\n\n"
+                                    f"Нажмите /start для выбора тарифа",
+                                    parse_mode='HTML'
+                                )
+                                await r.set(f'user:{user_id}:trial_reminder_sent', '1')
+                            except Exception as e:
+                                print(f"Не удалось отправить напоминание {user_id}: {e}")
                     
-                    await r.set(f'user:{user_id}:expiry_notified', '1')
-                    
-                    ref_link = await get_referral_link(user_id)
-                    
-                    try:
-                        await bot.send_message(
-                            user_id,
-                            f"⏰ <b>Пробный период истёк</b>\n\n"
-                            f"Чтобы продолжить копировать посты:\n"
-                            f"1️⃣ Купите подписку звёздами\n"
-                            f"2️⃣ Пригласите друга → +1 день бесплатно\n\n"
-                            f"👥 <b>Ваша ссылка:</b>\n<code>{ref_link}</code>\n\n"
-                            f"Нажмите /start для продолжения",
-                            parse_mode='HTML',
-                            reply_markup=main_menu_expired()
-                        )
-                        print(f"Уведомление об истечении отправлено user {user_id}")
-                    except Exception as e:
-                        print(f"Не удалось уведомить {user_id}: {e}")
+                    # Уведомление об окончании
+                    time_diff = (now - trial_end).total_seconds()
+                    if 0 <= time_diff <= 3600:
+                        notified = await r.get(f'user:{user_id}:expiry_notified')
+                        if notified:
+                            continue
                         
-            except Exception as e:
-                print(f"Ошибка проверки trial {user_id}: {e}")
-        
-        # Проверка платных подписок (уведомление за 1 день и при окончании)
-        async for key in r.scan_iter('user:*:sub_end'):
-            user_id = int(key.split(':')[1])
-            sub_str = await r.get(key)
-            
-            if not sub_str:
-                continue
-            
-            try:
-                sub_end = datetime.fromisoformat(sub_str)
-                
-                # Уведомление за 1 день до окончания подписки
-                day_before = sub_end - timedelta(days=1)
-                if 0 <= (now - day_before).total_seconds() <= 60:
-                    notified = await r.get(f'user:{user_id}:sub_reminder_sent')
-                    if not notified:
+                        sub_end = await r.get(f'user:{user_id}:sub_end')
+                        if sub_end and datetime.fromisoformat(sub_end) > now:
+                            continue
+                        
+                        extra = int(await r.get(f'user:{user_id}:extra_days') or 0)
+                        if extra > 0:
+                            continue
+                        
+                        await r.set(f'user:{user_id}:expiry_notified', '1')
+                        
                         ref_link = await get_referral_link(user_id)
+                        
                         try:
                             await bot.send_message(
                                 user_id,
-                                f"⏰ <b>Ваша подписка заканчивается завтра!</b>\n\n"
-                                f"📅 Дата окончания: {sub_end.strftime('%d.%m.%Y')}\n\n"
-                                f"Чтобы продолжить:\n"
+                                f"⏰ <b>Пробный период истёк</b>\n\n"
+                                f"Чтобы продолжить копировать посты:\n"
+                                f"1️⃣ Купите подписку звёздами\n"
+                                f"2️⃣ Пригласите друга → +1 день бесплатно\n\n"
+                                f"👥 <b>Ваша ссылка:</b>\n<code>{ref_link}</code>\n\n"
+                                f"Нажмите /start для продолжения",
+                                parse_mode='HTML',
+                                reply_markup=main_menu_expired()
+                            )
+                            print(f"Уведомление об истечении отправлено user {user_id}")
+                        except Exception as e:
+                            print(f"Не удалось уведомить {user_id}: {e}")
+                except Exception as e:
+                    print(f"Ошибка обработки trial ключа {key}: {e}")
+                    continue
+        except Exception as e:
+            print(f"Ошибка сканирования trial: {e}")
+        
+        # Проверка платных подписок
+        try:
+            async for key in r.scan_iter('user:*:sub_end'):
+                try:
+                    user_id = int(key.split(':')[1])
+                    sub_str = await r.get(key)
+                    
+                    if not sub_str:
+                        continue
+                    
+                    sub_end = datetime.fromisoformat(sub_str)
+                    
+                    # Уведомление за 1 день до окончания
+                    day_before = sub_end - timedelta(days=1)
+                    if 0 <= (now - day_before).total_seconds() <= 3600:
+                        notified = await r.get(f'user:{user_id}:sub_reminder_sent')
+                        if not notified:
+                            ref_link = await get_referral_link(user_id)
+                            try:
+                                await bot.send_message(
+                                    user_id,
+                                    f"⏰ <b>Ваша подписка заканчивается завтра!</b>\n\n"
+                                    f"📅 Дата окончания: {sub_end.strftime('%d.%m.%Y')}\n\n"
+                                    f"Чтобы продолжить:\n"
+                                    f"1️⃣ Продлите подписку звёздами\n"
+                                    f"2️⃣ Пригласите друга → +1 день бесплатно\n\n"
+                                    f"👥 <b>Ваша ссылка:</b>\n<code>{ref_link}</code>\n\n"
+                                    f"Нажмите /start для продления",
+                                    parse_mode='HTML'
+                                )
+                                await r.set(f'user:{user_id}:sub_reminder_sent', '1')
+                                print(f"Напоминание о продлении отправлено user {user_id}")
+                            except Exception as e:
+                                print(f"Не удалось отправить напоминание {user_id}: {e}")
+                    
+                    # Уведомление об окончании подписки
+                    time_diff = (now - sub_end).total_seconds()
+                    if 0 <= time_diff <= 3600:
+                        notified = await r.get(f'user:{user_id}:sub_expired_notified')
+                        if notified:
+                            continue
+                        
+                        extra = int(await r.get(f'user:{user_id}:extra_days') or 0)
+                        if extra > 0:
+                            continue
+                        
+                        await r.set(f'user:{user_id}:sub_expired_notified', '1')
+                        
+                        ref_link = await get_referral_link(user_id)
+                        
+                        try:
+                            await bot.send_message(
+                                user_id,
+                                f"⏰ <b>Ваша подписка истекла</b>\n\n"
+                                f"Чтобы продолжить копировать посты:\n"
                                 f"1️⃣ Продлите подписку звёздами\n"
                                 f"2️⃣ Пригласите друга → +1 день бесплатно\n\n"
                                 f"👥 <b>Ваша ссылка:</b>\n<code>{ref_link}</code>\n\n"
-                                f"Нажмите /start для продления",
-                                parse_mode='HTML'
+                                f"Нажмите /start для продолжения",
+                                parse_mode='HTML',
+                                reply_markup=main_menu_expired()
                             )
-                            await r.set(f'user:{user_id}:sub_reminder_sent', '1')
-                            print(f"Напоминание о продлении отправлено user {user_id}")
+                            print(f"Уведомление об окончании подписки отправлено user {user_id}")
                         except Exception as e:
-                            print(f"Не удалось отправить напоминание {user_id}: {e}")
-                
-                # Уведомление об окончании подписки
-                time_diff = (now - sub_end).total_seconds()
-                if 0 <= time_diff <= 60:
-                    notified = await r.get(f'user:{user_id}:sub_expired_notified')
-                    if notified:
-                        continue
-                    
-                    extra = int(await r.get(f'user:{user_id}:extra_days') or 0)
-                    if extra > 0:
-                        continue
-                    
-                    await r.set(f'user:{user_id}:sub_expired_notified', '1')
-                    
-                    ref_link = await get_referral_link(user_id)
-                    
-                    try:
-                        await bot.send_message(
-                            user_id,
-                            f"⏰ <b>Ваша подписка истекла</b>\n\n"
-                            f"Чтобы продолжить копировать посты:\n"
-                            f"1️⃣ Продлите подписку звёздами\n"
-                            f"2️⃣ Пригласите друга → +1 день бесплатно\n\n"
-                            f"👥 <b>Ваша ссылка:</b>\n<code>{ref_link}</code>\n\n"
-                            f"Нажмите /start для продолжения",
-                            parse_mode='HTML',
-                            reply_markup=main_menu_expired()
-                        )
-                        print(f"Уведомление об окончании подписки отправлено user {user_id}")
-                    except Exception as e:
-                        print(f"Не удалось уведомить {user_id}: {e}")
-                        
-            except Exception as e:
-                print(f"Ошибка проверки sub {user_id}: {e}")
-
-# ====================== ЗАПУСК ======================
+                            print(f"Не удалось уведомить {user_id}: {e}")
+                except Exception as e:
+                    print(f"Ошибка обработки sub ключа {key}: {e}")
+                    continue
+        except Exception as e:
+            print(f"Ошибка сканирования sub: {e}")
 
 async def main():
+    if not BOT_TOKEN:
+        print("ERROR: BOT_TOKEN not set!")
+        return
+        
     await bot.delete_webhook(drop_pending_updates=True)
+    
+    # Запускаем фоновую задачу
     asyncio.create_task(subscription_checker())
+    
     print("Бот запущен!")
     await dp.start_polling(bot)
 
