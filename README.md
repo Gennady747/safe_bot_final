@@ -1,7 +1,6 @@
-  import asyncio
+import asyncio
 import os
 from datetime import datetime, timedelta
-import redis.asyncio as redis
 import re
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
@@ -11,19 +10,14 @@ from aiogram.types import (
 )
 
 BOT_TOKEN = os.getenv('BOT_TOKEN', '')
-REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost:6379/0')
 
 TRIAL_DAYS = 3
 
 PRICES = {'week': 10, 'twoweeks': 20, 'threeweeks': 30, 'month': 40}
 DAYS_MAP = {'week': 7, 'twoweeks': 14, 'threeweeks': 21, 'month': 28}
 
-# Инициализация Redis с проверкой
-try:
-    r = redis.from_url(REDIS_URL, decode_responses=True)
-except Exception as e:
-    print(f"Redis connection error: {e}")
-    r = None
+# Хранилище в памяти (будет сбрасываться при перезапуске)
+users_data = {}
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -90,79 +84,78 @@ def link_input_menu():
 
 # ====================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ======================
 
+def get_user(user_id: int):
+    if user_id not in users_data:
+        users_data[user_id] = {}
+    return users_data[user_id]
+
 async def is_active(user_id: int) -> bool:
-    if not r:
-        return True
-    
+    user = get_user(user_id)
     now = datetime.utcnow()
     
-    sub_end = await r.get(f'user:{user_id}:sub_end')
+    sub_end = user.get('sub_end')
     if sub_end and datetime.fromisoformat(sub_end) > now:
         return True
     
-    trial_end = await r.get(f'user:{user_id}:trial_end')
+    trial_end = user.get('trial_end')
     if trial_end and datetime.fromisoformat(trial_end) > now:
         return True
     
-    extra = int(await r.get(f'user:{user_id}:extra_days') or 0)
+    extra = user.get('extra_days', 0)
     if extra > 0:
         return True
     
-    trial_started = await r.exists(f'user:{user_id}:trial_started')
-    if not trial_started:
+    if 'trial_started' not in user:
         return True
     
     return False
 
 async def is_expired(user_id: int) -> bool:
-    if not r:
-        return False
-    
+    user = get_user(user_id)
     now = datetime.utcnow()
     
-    sub_end = await r.get(f'user:{user_id}:sub_end')
+    sub_end = user.get('sub_end')
     if sub_end and datetime.fromisoformat(sub_end) > now:
         return False
     
-    trial_end = await r.get(f'user:{user_id}:trial_end')
+    trial_end = user.get('trial_end')
     if trial_end and datetime.fromisoformat(trial_end) > now:
         return False
     
-    extra = int(await r.get(f'user:{user_id}:extra_days') or 0)
+    extra = user.get('extra_days', 0)
     if extra > 0:
         return False
     
-    trial_started = await r.exists(f'user:{user_id}:trial_started')
-    if not trial_started:
+    if 'trial_started' not in user:
         return False
     
     return True
 
 async def start_trial(user_id: int):
-    if not r:
-        return False
-    
-    trial_started = await r.exists(f'user:{user_id}:trial_started')
-    if trial_started:
+    user = get_user(user_id)
+    if 'trial_started' in user:
         return False
     
     now = datetime.utcnow()
     end = now + timedelta(days=TRIAL_DAYS)
     
-    await r.set(f'user:{user_id}:trial_started', now.isoformat())
-    await r.set(f'user:{user_id}:trial_end', end.isoformat())
+    user['trial_started'] = now.isoformat()
+    user['trial_end'] = end.isoformat()
     
     return True
 
 async def get_referral_link(user_id: int) -> str:
-    if not r:
-        return f"https://t.me/bot?start=ref{user_id}"
+    user = get_user(user_id)
     
-    ref_code = await r.get(f'user:{user_id}:ref_code')
-    if not ref_code:
+    if 'ref_code' not in user:
         ref_code = f'ref{user_id % 1000000:06d}'
-        await r.set(f'user:{user_id}:ref_code', ref_code)
-        await r.set(f'ref:{ref_code}', user_id)
+        user['ref_code'] = ref_code
+        # Сохраняем обратную связь код -> user_id
+        if 'ref_codes' not in users_data:
+            users_data['ref_codes'] = {}
+        users_data['ref_codes'][ref_code] = user_id
+    
+    ref_code = user['ref_code']
     
     try:
         bot_info = await bot.get_me()
@@ -171,13 +164,12 @@ async def get_referral_link(user_id: int) -> str:
         return f"https://t.me/bot?start={ref_code}"
 
 async def get_user_settings(user_id: int):
-    if not r:
-        return None, '', ''
-    
-    channel = await r.get(f'user:{user_id}:channel')
-    block_top = await r.get(f'user:{user_id}:block_top') or ''
-    block_bottom = await r.get(f'user:{user_id}:block_bottom') or ''
-    return channel, block_top, block_bottom
+    user = get_user(user_id)
+    return (
+        user.get('channel'),
+        user.get('block_top', ''),
+        user.get('block_bottom', '')
+    )
 
 def clean_text(text: str) -> str:
     if not text:
@@ -192,29 +184,31 @@ def clean_text(text: str) -> str:
 @dp.message(Command('start'))
 async def cmd_start(message: Message):
     user_id = message.from_user.id
+    user = get_user(user_id)
     
-    if r:
-        is_new_user = not await r.exists(f'user:{user_id}:first_seen')
+    is_new_user = 'first_seen' not in user
+    
+    if is_new_user:
+        user['first_seen'] = datetime.utcnow().isoformat()
+        user['username'] = message.from_user.username or 'нет'
+    
+    # Обработка реферальной ссылки
+    ref_param = message.text.split()[-1] if len(message.text.split()) > 1 else None
+    if ref_param and ref_param.startswith('ref'):
+        referrer_code = ref_param[3:]
+        ref_codes = users_data.get('ref_codes', {})
         
-        if is_new_user:
-            await r.set(f'user:{user_id}:first_seen', datetime.utcnow().isoformat())
-            await r.set(f'user:{user_id}:username', message.from_user.username or 'нет')
-        
-        # Обработка реферальной ссылки
-        ref_param = message.text.split()[-1] if len(message.text.split()) > 1 else None
-        if ref_param and ref_param.startswith('ref'):
-            referrer_code = ref_param[3:]
-            referrer_id = await r.get(f'ref:{referrer_code}')
-            
-            if referrer_id and int(referrer_id) != user_id:
-                already_referred = await r.get(f'user:{user_id}:referred_by')
-                if not already_referred:
-                    await r.incr(f'user:{referrer_id}:extra_days')
-                    await r.set(f'user:{user_id}:referred_by', referrer_id)
+        if referrer_code in ref_codes:
+            referrer_id = ref_codes[referrer_code]
+            if referrer_id != user_id:
+                if 'referred_by' not in user:
+                    referrer = get_user(referrer_id)
+                    referrer['extra_days'] = referrer.get('extra_days', 0) + 1
+                    user['referred_by'] = referrer_id
                     
                     try:
                         await bot.send_message(
-                            int(referrer_id),
+                            referrer_id,
                             f"🎉 По вашей ссылке зарегистрировался пользователь!\n"
                             f"➕ +1 день бесплатно!"
                         )
@@ -225,7 +219,7 @@ async def cmd_start(message: Message):
 
     if await is_expired(user_id):
         ref_link = await get_referral_link(user_id)
-        extra_days = int(await r.get(f'user:{user_id}:extra_days') or 0) if r else 0
+        extra_days = user.get('extra_days', 0)
         
         await message.answer(
             f"⏰ <b>Время использования истекло</b>\n\n"
@@ -346,45 +340,39 @@ async def back_setup(callback: CallbackQuery):
 @dp.callback_query(F.data == "skip_block")
 async def skip_block(callback: CallbackQuery):
     user_id = callback.from_user.id
-    if not r:
-        await callback.answer("Ошибка базы данных", show_alert=True)
-        return
-        
-    state = await r.get(f'user:{user_id}:state')
+    user = get_user(user_id)
+    state = user.get('state')
     
     if state in ['set_block_top', 'waiting_link_text_top', 'waiting_link_url_top']:
-        await r.delete(f'user:{user_id}:block_top')
+        user.pop('block_top', None)
         await callback.message.edit_text(
             "✅ Верхний блок пропущен.\n\nВыберите действие:",
             reply_markup=setup_menu()
         )
     elif state in ['set_block_bottom', 'waiting_link_text_bottom', 'waiting_link_url_bottom']:
-        await r.delete(f'user:{user_id}:block_bottom')
+        user.pop('block_bottom', None)
         await callback.message.edit_text(
             "✅ Нижний блок пропущен.\n\nВыберите действие:",
             reply_markup=setup_menu()
         )
     
-    await r.delete(f'user:{user_id}:state')
-    await r.delete(f'user:{user_id}:temp_link_text')
+    user.pop('state', None)
+    user.pop('temp_link_text', None)
     await callback.answer()
 
 @dp.callback_query(F.data == "back_to_block_input")
 async def back_to_block_input(callback: CallbackQuery):
     user_id = callback.from_user.id
-    if not r:
-        await callback.answer("Ошибка базы данных", show_alert=True)
-        return
-        
-    current_block = await r.get(f'user:{user_id}:current_block')
+    user = get_user(user_id)
+    current_block = user.get('current_block')
     
     if current_block == 'top':
         await set_block_top(callback)
     else:
         await set_block_bottom(callback)
     
-    await r.delete(f'user:{user_id}:temp_link_text')
-    await r.delete(f'user:{user_id}:current_block')
+    user.pop('temp_link_text', None)
+    user.pop('current_block', None)
 
 @dp.callback_query(F.data == "set_channel")
 async def set_channel(callback: CallbackQuery):
@@ -394,9 +382,7 @@ async def set_channel(callback: CallbackQuery):
         await callback.answer("❌ Время использования истекло!", show_alert=True)
         return
     
-    if not r:
-        await callback.answer("Ошибка базы данных", show_alert=True)
-        return
+    user = get_user(user_id)
     
     await callback.message.edit_text(
         "📢 <b>Настройка канала</b>\n\n"
@@ -409,7 +395,7 @@ async def set_channel(callback: CallbackQuery):
         parse_mode='HTML',
         reply_markup=back_only_menu()
     )
-    await r.set(f'user:{user_id}:state', 'set_channel')
+    user['state'] = 'set_channel'
     await callback.answer()
 
 @dp.callback_query(F.data == "set_block_top")
@@ -420,11 +406,8 @@ async def set_block_top(callback: CallbackQuery):
         await callback.answer("❌ Время использования истекло!", show_alert=True)
         return
     
-    if not r:
-        await callback.answer("Ошибка базы данных", show_alert=True)
-        return
-    
-    current = await r.get(f'user:{user_id}:block_top') or ''
+    user = get_user(user_id)
+    current = user.get('block_top', '')
     
     text = (
         "🔼 <b>Верхний блок</b>\n\n"
@@ -439,7 +422,7 @@ async def set_block_top(callback: CallbackQuery):
     text += "Отправьте текст:"
     
     await callback.message.edit_text(text, parse_mode='HTML', reply_markup=block_input_menu("top"))
-    await r.set(f'user:{user_id}:state', 'set_block_top')
+    user['state'] = 'set_block_top'
     await callback.answer()
 
 @dp.callback_query(F.data == "set_block_bottom")
@@ -450,11 +433,8 @@ async def set_block_bottom(callback: CallbackQuery):
         await callback.answer("❌ Время использования истекло!", show_alert=True)
         return
     
-    if not r:
-        await callback.answer("Ошибка базы данных", show_alert=True)
-        return
-    
-    current = await r.get(f'user:{user_id}:block_bottom') or ''
+    user = get_user(user_id)
+    current = user.get('block_bottom', '')
     
     text = (
         "🔽 <b>Нижний блок</b>\n\n"
@@ -469,16 +449,13 @@ async def set_block_bottom(callback: CallbackQuery):
     text += "Отправьте текст:"
     
     await callback.message.edit_text(text, parse_mode='HTML', reply_markup=block_input_menu("bottom"))
-    await r.set(f'user:{user_id}:state', 'set_block_bottom')
+    user['state'] = 'set_block_bottom'
     await callback.answer()
 
 @dp.callback_query(F.data == "add_link_top")
 async def add_link_top(callback: CallbackQuery):
     user_id = callback.from_user.id
-    
-    if not r:
-        await callback.answer("Ошибка базы данных", show_alert=True)
-        return
+    user = get_user(user_id)
     
     await callback.message.edit_text(
         "🔗 <b>Кликабельная ссылка</b>\n\n"
@@ -488,17 +465,14 @@ async def add_link_top(callback: CallbackQuery):
         parse_mode='HTML',
         reply_markup=link_input_menu()
     )
-    await r.set(f'user:{user_id}:state', 'waiting_link_text_top')
-    await r.set(f'user:{user_id}:current_block', 'top')
+    user['state'] = 'waiting_link_text_top'
+    user['current_block'] = 'top'
     await callback.answer()
 
 @dp.callback_query(F.data == "add_link_bottom")
 async def add_link_bottom(callback: CallbackQuery):
     user_id = callback.from_user.id
-    
-    if not r:
-        await callback.answer("Ошибка базы данных", show_alert=True)
-        return
+    user = get_user(user_id)
     
     await callback.message.edit_text(
         "🔗 <b>Кликабельная ссылка</b>\n\n"
@@ -508,19 +482,15 @@ async def add_link_bottom(callback: CallbackQuery):
         parse_mode='HTML',
         reply_markup=link_input_menu()
     )
-    await r.set(f'user:{user_id}:state', 'waiting_link_text_bottom')
-    await r.set(f'user:{user_id}:current_block', 'bottom')
+    user['state'] = 'waiting_link_text_bottom'
+    user['current_block'] = 'bottom'
     await callback.answer()
 
 @dp.message(F.text)
 async def handle_input(message: Message):
     user_id = message.from_user.id
-    
-    if not r:
-        await message.answer("❌ Ошибка базы данных")
-        return
-        
-    state = await r.get(f'user:{user_id}:state')
+    user = get_user(user_id)
+    state = user.get('state')
     
     if not state:
         return
@@ -552,7 +522,7 @@ async def handle_input(message: Message):
                 return
             
             chat = await bot.get_chat(channel_id)
-            await r.set(f'user:{user_id}:channel', str(chat.id))
+            user['channel'] = str(chat.id)
             
             await message.answer(
                 f"✅ Канал настроен: {chat.title}\n\n"
@@ -569,27 +539,27 @@ async def handle_input(message: Message):
             return
 
     elif state == "set_block_top":
-        await r.set(f'user:{user_id}:block_top', text)
+        user['block_top'] = text
         preview = text[:200] + ('...' if len(text) > 200 else '')
         await message.answer(
             f"✅ Верхний блок сохранён!\n\n<code>{preview}</code>",
             parse_mode='HTML',
             reply_markup=setup_menu()
         )
-        await r.delete(f'user:{user_id}:state')
+        user.pop('state', None)
 
     elif state == "set_block_bottom":
-        await r.set(f'user:{user_id}:block_bottom', text)
+        user['block_bottom'] = text
         preview = text[:200] + ('...' if len(text) > 200 else '')
         await message.answer(
             f"✅ Нижний блок сохранён!\n\n<code>{preview}</code>",
             parse_mode='HTML',
             reply_markup=setup_menu()
         )
-        await r.delete(f'user:{user_id}:state')
+        user.pop('state', None)
 
     elif state == "waiting_link_text_top":
-        await r.set(f'user:{user_id}:temp_link_text', text)
+        user['temp_link_text'] = text
         await message.answer(
             "🔗 <b>Шаг 2/2</b>\n\n"
             "Отправьте URL ссылки\n\n"
@@ -599,14 +569,14 @@ async def handle_input(message: Message):
             parse_mode='HTML',
             reply_markup=link_input_menu()
         )
-        await r.set(f'user:{user_id}:state', 'waiting_link_url_top')
+        user['state'] = 'waiting_link_url_top'
 
     elif state == "waiting_link_url_top":
-        link_text = await r.get(f'user:{user_id}:temp_link_text')
+        link_text = user.get('temp_link_text', '')
         link_url = text
         
         clickable_link = f'<a href="{link_url}">{link_text}</a>'
-        await r.set(f'user:{user_id}:block_top', clickable_link)
+        user['block_top'] = clickable_link
         
         await message.answer(
             f"✅ Верхний блок сохранён!\n\n"
@@ -615,12 +585,12 @@ async def handle_input(message: Message):
             parse_mode='HTML',
             reply_markup=setup_menu()
         )
-        await r.delete(f'user:{user_id}:state')
-        await r.delete(f'user:{user_id}:temp_link_text')
-        await r.delete(f'user:{user_id}:current_block')
+        user.pop('state', None)
+        user.pop('temp_link_text', None)
+        user.pop('current_block', None)
 
     elif state == "waiting_link_text_bottom":
-        await r.set(f'user:{user_id}:temp_link_text', text)
+        user['temp_link_text'] = text
         await message.answer(
             "🔗 <b>Шаг 2/2</b>\n\n"
             "Отправьте URL ссылки\n\n"
@@ -630,14 +600,14 @@ async def handle_input(message: Message):
             parse_mode='HTML',
             reply_markup=link_input_menu()
         )
-        await r.set(f'user:{user_id}:state', 'waiting_link_url_bottom')
+        user['state'] = 'waiting_link_url_bottom'
 
     elif state == "waiting_link_url_bottom":
-        link_text = await r.get(f'user:{user_id}:temp_link_text')
+        link_text = user.get('temp_link_text', '')
         link_url = text
         
         clickable_link = f'<a href="{link_url}">{link_text}</a>'
-        await r.set(f'user:{user_id}:block_bottom', clickable_link)
+        user['block_bottom'] = clickable_link
         
         await message.answer(
             f"✅ Нижний блок сохранён!\n\n"
@@ -646,9 +616,9 @@ async def handle_input(message: Message):
             parse_mode='HTML',
             reply_markup=setup_menu()
         )
-        await r.delete(f'user:{user_id}:state')
-        await r.delete(f'user:{user_id}:temp_link_text')
-        await r.delete(f'user:{user_id}:current_block')
+        user.pop('state', None)
+        user.pop('temp_link_text', None)
+        user.pop('current_block', None)
 
 @dp.message(F.forward_origin)
 async def handle_forward(message: Message):
@@ -739,7 +709,8 @@ async def handle_forward(message: Message):
 async def show_referral(callback: CallbackQuery):
     user_id = callback.from_user.id
     ref_link = await get_referral_link(user_id)
-    extra_days = int(await r.get(f'user:{user_id}:extra_days') or 0) if r else 0
+    user = get_user(user_id)
+    extra_days = user.get('extra_days', 0)
     
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -824,10 +795,6 @@ async def pre_checkout(pre: PreCheckoutQuery):
 
 @dp.message(F.successful_payment)
 async def got_payment(message: Message):
-    if not r:
-        await message.answer("❌ Ошибка базы данных")
-        return
-        
     payload = message.successful_payment.invoice_payload
     parts = payload.split('_')
     
@@ -841,17 +808,17 @@ async def got_payment(message: Message):
         return
     
     days = DAYS_MAP[period]
-    price = PRICES[period]
-    extra = int(await r.get(f'user:{user_id}:extra_days') or 0)
+    user = get_user(user_id)
+    extra = user.get('extra_days', 0)
     total_days = days + extra
     
     if extra > 0:
-        await r.set(f'user:{user_id}:extra_days', 0)
+        user['extra_days'] = 0
     
     now = datetime.utcnow()
     
     # Проверяем, есть ли активная подписка — продлеваем от неё
-    current_sub_end = await r.get(f'user:{user_id}:sub_end')
+    current_sub_end = user.get('sub_end')
     if current_sub_end:
         current_end = datetime.fromisoformat(current_sub_end)
         if current_end > now:
@@ -864,10 +831,10 @@ async def got_payment(message: Message):
         end_date = now + timedelta(days=total_days)
         is_extended = False
     
-    await r.set(f'user:{user_id}:sub_end', end_date.isoformat())
-    await r.delete(f'user:{user_id}:trial_end')
-    await r.delete(f'user:{user_id}:trial_started')
-    await r.delete(f'user:{user_id}:expiry_notified')
+    user['sub_end'] = end_date.isoformat()
+    user.pop('trial_end', None)
+    user.pop('trial_started', None)
+    user.pop('expiry_notified', None)
     
     # Уведомление о продлении/покупке
     if is_extended:
@@ -889,30 +856,24 @@ async def got_payment(message: Message):
 async def subscription_checker():
     """Фоновая задача для проверки подписок и отправки уведомлений"""
     while True:
-        await asyncio.sleep(3600)  # Проверка каждый час (было 60 сек)
+        await asyncio.sleep(3600)  # Проверка каждый час
         
-        if not r:
-            continue
-            
         now = datetime.utcnow()
         
-        # Проверка пробных периодов
-        try:
-            async for key in r.scan_iter('user:*:trial_end'):
-                try:
-                    user_id = int(key.split(':')[1])
-                    trial_str = await r.get(key)
-                    
-                    if not trial_str:
-                        continue
-                    
-                    trial_end = datetime.fromisoformat(trial_str)
+        for user_id, user in list(users_data.items()):
+            if not isinstance(user_id, int):
+                continue
+                
+            try:
+                # Проверка пробного периода
+                trial_end = user.get('trial_end')
+                if trial_end:
+                    trial_end_dt = datetime.fromisoformat(trial_end)
                     
                     # Уведомление за 1 день до окончания
-                    day_before = trial_end - timedelta(days=1)
+                    day_before = trial_end_dt - timedelta(days=1)
                     if 0 <= (now - day_before).total_seconds() <= 3600:
-                        notified = await r.get(f'user:{user_id}:trial_reminder_sent')
-                        if not notified:
+                        if not user.get('trial_reminder_sent'):
                             try:
                                 await bot.send_message(
                                     user_id,
@@ -923,27 +884,25 @@ async def subscription_checker():
                                     f"Нажмите /start для выбора тарифа",
                                     parse_mode='HTML'
                                 )
-                                await r.set(f'user:{user_id}:trial_reminder_sent', '1')
+                                user['trial_reminder_sent'] = True
                             except Exception as e:
                                 print(f"Не удалось отправить напоминание {user_id}: {e}")
                     
                     # Уведомление об окончании
-                    time_diff = (now - trial_end).total_seconds()
+                    time_diff = (now - trial_end_dt).total_seconds()
                     if 0 <= time_diff <= 3600:
-                        notified = await r.get(f'user:{user_id}:expiry_notified')
-                        if notified:
+                        if user.get('expiry_notified'):
                             continue
                         
-                        sub_end = await r.get(f'user:{user_id}:sub_end')
+                        sub_end = user.get('sub_end')
                         if sub_end and datetime.fromisoformat(sub_end) > now:
                             continue
                         
-                        extra = int(await r.get(f'user:{user_id}:extra_days') or 0)
+                        extra = user.get('extra_days', 0)
                         if extra > 0:
                             continue
                         
-                        await r.set(f'user:{user_id}:expiry_notified', '1')
-                        
+                        user['expiry_notified'] = True
                         ref_link = await get_referral_link(user_id)
                         
                         try:
@@ -961,35 +920,22 @@ async def subscription_checker():
                             print(f"Уведомление об истечении отправлено user {user_id}")
                         except Exception as e:
                             print(f"Не удалось уведомить {user_id}: {e}")
-                except Exception as e:
-                    print(f"Ошибка обработки trial ключа {key}: {e}")
-                    continue
-        except Exception as e:
-            print(f"Ошибка сканирования trial: {e}")
-        
-        # Проверка платных подписок
-        try:
-            async for key in r.scan_iter('user:*:sub_end'):
-                try:
-                    user_id = int(key.split(':')[1])
-                    sub_str = await r.get(key)
-                    
-                    if not sub_str:
-                        continue
-                    
-                    sub_end = datetime.fromisoformat(sub_str)
+                
+                # Проверка платных подписок
+                sub_end = user.get('sub_end')
+                if sub_end:
+                    sub_end_dt = datetime.fromisoformat(sub_end)
                     
                     # Уведомление за 1 день до окончания
-                    day_before = sub_end - timedelta(days=1)
+                    day_before = sub_end_dt - timedelta(days=1)
                     if 0 <= (now - day_before).total_seconds() <= 3600:
-                        notified = await r.get(f'user:{user_id}:sub_reminder_sent')
-                        if not notified:
+                        if not user.get('sub_reminder_sent'):
                             ref_link = await get_referral_link(user_id)
                             try:
                                 await bot.send_message(
                                     user_id,
                                     f"⏰ <b>Ваша подписка заканчивается завтра!</b>\n\n"
-                                    f"📅 Дата окончания: {sub_end.strftime('%d.%m.%Y')}\n\n"
+                                    f"📅 Дата окончания: {sub_end_dt.strftime('%d.%m.%Y')}\n\n"
                                     f"Чтобы продолжить:\n"
                                     f"1️⃣ Продлите подписку звёздами\n"
                                     f"2️⃣ Пригласите друга → +1 день бесплатно\n\n"
@@ -997,24 +943,22 @@ async def subscription_checker():
                                     f"Нажмите /start для продления",
                                     parse_mode='HTML'
                                 )
-                                await r.set(f'user:{user_id}:sub_reminder_sent', '1')
+                                user['sub_reminder_sent'] = True
                                 print(f"Напоминание о продлении отправлено user {user_id}")
                             except Exception as e:
                                 print(f"Не удалось отправить напоминание {user_id}: {e}")
                     
                     # Уведомление об окончании подписки
-                    time_diff = (now - sub_end).total_seconds()
+                    time_diff = (now - sub_end_dt).total_seconds()
                     if 0 <= time_diff <= 3600:
-                        notified = await r.get(f'user:{user_id}:sub_expired_notified')
-                        if notified:
+                        if user.get('sub_expired_notified'):
                             continue
                         
-                        extra = int(await r.get(f'user:{user_id}:extra_days') or 0)
+                        extra = user.get('extra_days', 0)
                         if extra > 0:
                             continue
                         
-                        await r.set(f'user:{user_id}:sub_expired_notified', '1')
-                        
+                        user['sub_expired_notified'] = True
                         ref_link = await get_referral_link(user_id)
                         
                         try:
@@ -1032,11 +976,9 @@ async def subscription_checker():
                             print(f"Уведомление об окончании подписки отправлено user {user_id}")
                         except Exception as e:
                             print(f"Не удалось уведомить {user_id}: {e}")
-                except Exception as e:
-                    print(f"Ошибка обработки sub ключа {key}: {e}")
-                    continue
-        except Exception as e:
-            print(f"Ошибка сканирования sub: {e}")
+                            
+            except Exception as e:
+                print(f"Ошибка проверки user {user_id}: {e}")
 
 async def main():
     if not BOT_TOKEN:
